@@ -1,16 +1,15 @@
 /*
-  Example code for pH and E.C. measurements together 
-  
+  Example code for pH and E.C. mini Kit
   http://www.cyber-plant.com
   by CyberPlant LLC, 13 December 2015
   This example code is in the public domain.
-
-
+  upd. 15 March 2016
 */
-#include <Wire.h>
+#include <SimpleTimer.h>
+#include "Wire.h"
 #include <EEPROM.h>
 #include <OneWire.h>
-#include <DS18B20.h>
+#include <DallasTemperature.h>
 
 #define X0 0.0
 #define X1 2.0
@@ -18,40 +17,25 @@
 #define X3 80.0
 #define pHtoI2C 0x48
 #define T 273.15 // degrees Kelvin
-#define alphaLTC 0.022 // The linear temperature coefficient
-
-float voltage, data;
-byte highbyte, lowbyte, configRegister;
-
-float A;
-float B;
-float C;
-
-long pulseCount = 0;  //a pulse counter variable
-long pulseCal;
-byte ECcal = 0;
-
-unsigned long pulseTime,lastTime, duration, totalDuration;
+#define alphaLTC 0.022 // The linear Temperature coefficient
+#define ONE_WIRE_BUS 3 // Connect DS18B20 Temp sensor to pin D3
 
 
-unsigned int Interval=1000;
-long previousMillis = 0;
-unsigned long Time;
-
-float pH;
+float voltage, pHvoltage, pH, pHlcd, pHStateL, pHStateH, Temp, TempStateL, TempStateH;
 float EC;
-float temp;
-float tempManual = 25.0;
+float TempManual = 25.0;
 
 int sequence = 0;
 
-const byte ONEWIRE_PIN = 3; // temperature sensor ds18b20, pin D3
-byte address[8];
-OneWire onewire(ONEWIRE_PIN);
-DS18B20 sensors(&onewire);
+volatile bool counting;
+volatile unsigned long events;
+unsigned long total;
+int incomingByte = 0;
 
-int incomingByte = 0;  
- 
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+SimpleTimer timer;
+
 long Y0;
 long Y1;
 long Y2;
@@ -59,19 +43,15 @@ long Y3;
 float IsoP;
 float AlphaL;
 float AlphaH;
-  
+
 void setup()
 {
 
-  
+
   Serial.begin(9600);
   Wire.begin();
-  Time=millis();
-  pinMode(2, INPUT_PULLUP); //  An internal 20K-ohm resistor is pulled to 5V. If you use hardware pull-up delete this
-  sensors.begin();
-  Search_sensors();
-  Read_EE();
-  
+
+  // pinMode(2, INPUT_PULLUP); //  An internal 20K-ohm resistor is pulled to 5V. If you use hardware pull-up delete this
   Serial.println("Calibrate commands:");
   Serial.println("E.C. :");
   Serial.println("      Cal. 0,00 uS ---- 0");
@@ -85,27 +65,31 @@ void setup()
   Serial.println("      Cal. pH 10.00 --- 9");
   Serial.println("      Reset pH ---------8");
   Serial.println("  ");
+
   delay(250);
 
+  Read_EE();
+  timer.setInterval(1000L, TotalEvents);
+  attachInterrupt (0, eventISR, FALLING);
 }
 
- struct MyObject {
-long Y0;
-long Y1;
-long Y2;
-long Y3;
-float IsoP;
-float AlphaL;
-float AlphaH;
+struct MyObject {
+  long Y0;
+  long Y1;
+  long Y2;
+  long Y3;
+  float IsoP;
+  float AlphaL;
+  float AlphaH;
 };
 
 void Read_EE()
 {
-  int eeAddress = 0; 
+  int eeAddress = 0;
 
   MyObject customVar;
   EEPROM.get(eeAddress, customVar);
-  
+
   Y0 = (customVar.Y0);
   Y1 = (customVar.Y1);
   Y2 = (customVar.Y2);
@@ -130,271 +114,209 @@ void SaveSet()
   EEPROM.put(eeAddress, customVar);
 }
 
-float temp_read() // calculate pH
+void eventISR ()
 {
-      sensors.request(address);
-  
-  // Waiting (block the program) for measurement reesults
-  while(!sensors.available());
-  
-    temp = sensors.readTemperature(address);
-    return temp;
+  if (counting == true)
+    events++;
 }
 
-
-void ECread()  //graph function of read EC
+void TotalEvents()
 {
-     if (pulseCal>Y0 && pulseCal<Y1 )
-      {
-        A = (Y1 - Y0) / (X1 - X0);
-        B = Y0 - (A * X0);
-        C = (pulseCal - B) / A;
-      }
-      
-      if (pulseCal > Y1 && pulseCal<Y2 )
-      {
-        A = (Y2-Y1) / (X2 - X1);
-        B = Y1 - (A * X1);
-        C = (pulseCal - B) / A;
-      }
-      if (pulseCal > Y2)
-      {
-        A = (Y3-Y2) / (X3 - X2);
-        B = Y2 - (A * X2);
-        C = (pulseCal - B) / A;
-      }
-      
-    EC = (C / (1 + alphaLTC * (temp-25.00)));
+  if (counting == true) {
+    counting = false;
+    total = events;
+    TempRead();
+  }
+  else if (counting == false) {
+    noInterrupts ();
+    events = 0;
+    EIFR = bit (INTF0);
+    counting = true;
+    interrupts ();
+  }
 }
 
-void onPulse() // EC pulse counter
+void TempRead()
 {
-  pulseCount++;
+  sensors.requestTemperatures();
+  Temp = sensors.getTempCByIndex(0);
+  if (-20 > Temp || Temp > 200) {
+    Temp = TempManual;
+  }
+  ECcalculate();
 }
 
-void pH_read() // read ADS
+void ECcalculate()
 {
+  float A;
+  float B;
+  float C;
+
+  if (total < Y0)
+    C = 0;
+  else if (total >= Y0 && total < (Y0 + Y1))
+  {
+    A = (Y1 - Y0) / (X1 - X0);
+    B = Y0 - (A * X0);
+    C = (total  - B) / A;
+  }
+  else if (total >= (Y0 + Y1) && total < (Y2 + Y1 + Y0))
+  {
+    A = (Y2 - Y1) / (X2 - X1);
+    B = Y1 - (A * X1);
+    C = (total  - B) / A;
+  }
+  else if (total >= (Y2 + Y1 + Y0))
+  {
+    A = (Y3 - Y2) / (X3 - X2);
+    B = Y2 - (A * X2);
+    C = (total - B) / A;
+  }
+
+  EC = (C / (1 + alphaLTC * (Temp - 25.00)));
+
+  cicleRead();
+}
+
+void cicleRead()
+{
+  ADSread(0);
+  pHvoltage = voltage;
+  if (pHvoltage > 0)
+    pH = IsoP - AlphaL * (T + Temp) * pHvoltage;
+  else if (pHvoltage < 0)
+    pH = IsoP - AlphaH * (T + Temp) * pHvoltage;
+  showResults ();
+
+}
+
+void ADSread(int rate) // read ADS
+{
+
+  byte highbyte, lowbyte, configRegister;
+  float data;
+
   Wire.requestFrom(pHtoI2C, 3);
-  while(Wire.available())
+  //Wire.requestFrom(pHtoI2C, 3, sizeof(byte) * 3);
+  if (Wire.available())
   {
     highbyte = Wire.read();
     lowbyte = Wire.read();
     configRegister = Wire.read();
-  }
-  data = highbyte * 256;
-  data = data + lowbyte;
-  voltage = data * 2.048 ;
-  voltage = voltage / 32768;
-}
 
-void pH_calculate() // calculate pH
-{
-  if (voltage > 0)
-  pH = IsoP - AlphaL * (T + tempManual) * voltage;
-  else if (voltage < 0)
-  pH = IsoP - AlphaH * (T + tempManual) * voltage;
-}
+    data = highbyte * 256;
+    data = data + lowbyte;
+    voltage = data * 2.048 ;
 
-void Search_sensors() // search ds18b20 temperature sensor
-{
-  address[8];
-  
-  onewire.reset_search();
-  while(onewire.search(address))
-  {
-    if (address[0] != 0x28)
-      continue;
-      
-    if (OneWire::crc8(address, 7) != address[7])
+
+    switch (rate)
     {
-      Serial.println(F("temp sensor connection error!"));
-      temp = 25.0;
-      break;
-    }
-   /*
-    for (byte i=0; i<8; i++)
-    {
-      Serial.print(F("0x"));
-      Serial.print(address[i], HEX);
-      
-      if (i < 7)
-        Serial.print(F(", "));
-    }
-    
-    */
-  }
+      case 0:
+        voltage = voltage / 32768;
+        break;
+      /*
+          case 1:
+            voltage = voltage / 3276.8;
+            break;
+      */
+      case 2:
+        voltage = voltage / 327.68;
+        break;
 
+      case 3:
+        voltage = voltage / 32.768;
+        break;
+    }
+  }
 }
 
 void cal_sensors()
 {
   Serial.println(" ");
-  
- if (incomingByte == 53) // press key "5"
- {
-  Reset_EC();
- }
+
+  if (incomingByte == 53) // press key "5"
+  {
+    Serial.print("Reset EC ...");
+    Y0 = 220;
+    Y1 = 1245;
+    Y2 = 5282;
+    Y3 = 17255;
+  }
   else if (incomingByte == 48) // press key "0"
- {
-  ECcal = 1;
-  Serial.print("Cal. 0,00 uS ...");  
-  Y0 = pulseCal;
-  SaveSet();
-  ECcal = 0;
- }
- 
- else if (incomingByte == 49) // press key "1"
- {
-  ECcal = 1;
-  Serial.print("Cal. 2,00 uS ...");  
-  Y1 = pulseCal / (1 + alphaLTC * (temp-25.00));
-  ECread();
-  while (EC > X1)
-    {
-    Y1++;
-    ECread();
-    }
-  SaveSet();
-  ECcal = 0;
- }
- 
- else if (incomingByte == 50) // press key "2"
- {
-  ECcal = 1;
-  Serial.print("Cal. 12,88 uS ...");  
-  Y2 = pulseCal / (1 + alphaLTC * (temp-25.00));
-  ECread();
-  while (EC > X2)
-    {      
-    Y2++;
-    ECread();
-    }
-  SaveSet();
-  ECcal = 0;
- }
- 
+  {
+    Serial.print("Cal. 0,000 uS ...");
+    Y0 = total;
+  }
+
+  else if (incomingByte == 49) // press key "1"
+  {
+    Serial.print("Cal. 2,000 uS ...");
+    Y1 = total / (0.995 + alphaLTC * (Temp - 25.00));
+  }
+
+  else if (incomingByte == 50) // press key "2"
+  {
+    Serial.print("Cal. 12,880 uS ...");
+    Y2 = total / (0.997 + alphaLTC * (Temp - 25.00));
+  }
+
   else if (incomingByte == 51) // press key "3"
- {
-  ECcal = 1;
-  Serial.print("Cal. 80,00 uS ..."); 
-  Y3 = pulseCal / (1 + alphaLTC * (temp-25.00));
-  ECread(); 
-  while (EC > X3)
-    { 
-    Y3++;
-    ECread();
-    }
-  SaveSet();
-  ECcal = 0;
- }
- 
- if (incomingByte == 56) // press key "8"
- {
-  Reset_pH();
- }
- else if (incomingByte == 52) // press key "4"
- {
-  Serial.print("Cal. pH 4.00 ...");
-  AlphaL = (IsoP - 4) / voltage / (T + tempManual);
-  SaveSet();
- }
- else if (incomingByte == 55) // press key "7"
- {
-  Serial.print("Cal. pH 7.00 ...");
-  IsoP = (IsoP - pH + 7.00);
-  SaveSet();
- }
+  {
+    Serial.print("Cal. 80,000 uS ...");
+    Y3 = total / (0.995 + alphaLTC * (Temp - 25.00));
+  }
+
+  if (incomingByte == 56) // press key "8"
+  {
+    Serial.print("Reset pH ...");
+    IsoP = 7.5099949836;
+    AlphaL = 0.0778344535;
+    AlphaH = 0.0850976657;
+  }
+  else if (incomingByte == 52) // press key "4"
+  {
+    Serial.print("Cal. pH 4.00 ...");
+    AlphaL = (IsoP - 4) / voltage / (T + TempManual);
+  }
+  else if (incomingByte == 55) // press key "7"
+  {
+    Serial.print("Cal. pH 7.00 ...");
+    IsoP = (IsoP - pH + 7.00);
+  }
   else if (incomingByte == 57) // press key "9"
- {
-  Serial.print("Cal. pH 10.00 ...");
-  AlphaH = (IsoP - 10) / voltage / (T + tempManual); 
+  {
+    Serial.print("Cal. pH 10.00 ...");
+    AlphaH = (IsoP - 10) / voltage / (T + TempManual);
+  }
+
   SaveSet();
- }
-   Serial.println(" complete");
+  Serial.println(" complete");
+
 }
 
-void Reset_EC()
+void showResults ()
 {
-  ECcal = 1; 
-  Serial.print("Reset EC ..."); 
-  Y0 = 220;
-  Y1 = 1245;
-  Y2 = 5282;
-  Y3 = 17255;
-  SaveSet();
-  ECcal = 0;
-}
+  Serial.println("  ");
+  Serial.print("  Temp ");
+  Serial.print(Temp, 2);
+  Serial.print(" *C ");
+  Serial.print("  pH ");
+  Serial.print(pH);
+  Serial.print("  E.C. ");
+  Serial.println(EC);
 
-void Reset_pH()
-{
-  Serial.print("Reset pH ...");
-
-  IsoP = 7.5099949836;
-  AlphaL = 0.0778344535;
-  AlphaH = 0.0850976657;
-  SaveSet();
 }
 
 void loop()
 {
-  
-if (ECcal == 0)
-{
-  if (millis()-Time>=Interval)
-{  
-  Time = millis();
-  
-  sequence ++;
-  if (sequence > 1)
-  sequence = 0;
 
-
-   if (sequence==0)
+  if (Serial.available() > 0)
   {
-    pulseCount=0; //reset the pulse counter
-    attachInterrupt(0,onPulse,RISING); //attach an interrupt counter to interrupt pin 1 (digital pin #3) -- the only other possible pin on the 328p is interrupt pin #0 (digital pin #2)
+    incomingByte = Serial.read();
+    cal_sensors();
   }
-  
-   if (sequence==1)
-  {
-    detachInterrupt(0);
-    pulseCal = pulseCount;
-    temp_read();
-    if (temp > 200 || temp < -20 )
-  { 
-    temp = tempManual;
-    Serial.println("temp sensor connection error!");
-    Search_sensors();
-  }
+  timer.run();
 
-
-  ECread();
-  pH_read();
-  pH_calculate();
-  
-  // Prints measurements on Serial Monitor
-  Serial.println("  ");
-  Serial.print("t ");
-  Serial.print(temp);
-  Serial.print(F(" *C"));
-  Serial.print("    pH ");
-  Serial.print(pH); // uS/cm
-  Serial.print("    E.C. ");
-  Serial.print(EC); // uS/cm
-  Serial.print("    pulses/sec = ");
-  Serial.print(pulseCal);
-  Serial.print("    C = ");
-  Serial.println(C); // Conductivity without temperature compensation
-  }
 }
 
-    if (Serial.available() > 0) //  function of calibration E.C.
-    {  
-        incomingByte = Serial.read();
-        cal_sensors();
-    }
-}
-}
-
-/*-----------------------------------End loop---------------------------------------*/
 
